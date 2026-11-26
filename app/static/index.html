@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redis 会话迁移台</title>
+<style>
+  :root { --bd:#d8dee4; --ok:#1a7f37; --warn:#9a6700; --bad:#cf222e; --muted:#57606a; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f6f8fa; color: #1f2328; }
+  header { background: #24292f; color: #fff; padding: 14px 24px; }
+  header h1 { margin: 0; font-size: 18px; }
+  header .sub { color: #aebac7; font-size: 12px; margin-top: 4px; }
+  main { max-width: 1080px; margin: 20px auto; padding: 0 16px; display: grid; gap: 16px; }
+  section { background: #fff; border: 1px solid var(--bd); border-radius: 8px; padding: 16px; }
+  h2 { margin: 0 0 12px; font-size: 15px; }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .badge { padding: 3px 10px; border-radius: 12px; font-size: 12px; border: 1px solid var(--bd); }
+  .b-ok { background: #dafbe1; color: var(--ok); border-color: #aceebb; }
+  .b-warn { background: #fff8c5; color: var(--warn); border-color: #eac54f; }
+  .b-bad { background: #ffebe9; color: var(--bad); border-color: #ffb3ad; }
+  .b-muted { background: #eaeef2; color: var(--muted); }
+  button { font: inherit; padding: 6px 12px; border: 1px solid var(--bd); border-radius: 6px;
+           background: #f6f8fa; cursor: pointer; margin: 2px 4px 2px 0; }
+  button:hover { background: #eaeef2; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  button.primary:hover { background: #1a62d0; }
+  button.danger { color: var(--bad); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .counters { display: flex; gap: 18px; flex-wrap: wrap; margin: 10px 0; font-size: 14px; }
+  .counters b { font-size: 18px; }
+  .held { background: #fff8c5; border: 1px solid #eac54f; border-radius: 6px;
+          padding: 8px 12px; margin: 8px 0; font-size: 13px; display: none; }
+  .log { background: #0d1117; color: #c9d1d9; border-radius: 6px; padding: 10px 12px;
+         font-family: ui-monospace, monospace; font-size: 12px; max-height: 180px;
+         overflow-y: auto; white-space: pre-wrap; }
+  input[type=text], input[type=number] { font: inherit; padding: 6px 10px;
+         border: 1px solid var(--bd); border-radius: 6px; width: 220px; }
+  input[type=number] { width: 90px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border-bottom: 1px solid var(--bd); padding: 6px 8px; text-align: left; }
+  th { background: #f6f8fa; }
+  tr:hover td { background: #f6f8fa; cursor: pointer; }
+  pre { background: #f6f8fa; border: 1px solid var(--bd); border-radius: 6px;
+        padding: 10px; font-size: 12px; overflow-x: auto; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .hint { color: var(--muted); font-size: 12px; }
+  .v-ok { color: var(--ok); } .v-bad { color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Redis 会话迁移台</h1>
+  <div class="sub">旧库只读 · 分批搬运 · 新库为准 · 已登录用户会话不中断</div>
+</header>
+<main>
+  <section>
+    <h2>① 迁移控制</h2>
+    <div class="badges" id="badges"></div>
+    <div class="row">
+      <button class="primary" onclick="act('start')">开始/继续自动搬运</button>
+      <button onclick="act('pause')">暂停</button>
+      <button onclick="act('step/read')">读取一批（暂停写入）</button>
+      <button onclick="act('step/write')">写入持有批次</button>
+      <button onclick="act('step/discard')">丢弃持有批次</button>
+      <button onclick="act('reset')">重置搬运</button>
+      <button class="danger" onclick="disableFallback()">关闭旧库回读</button>
+    </div>
+    <div class="counters" id="counters"></div>
+    <div class="held" id="held"></div>
+    <div class="hint" id="msg"></div>
+    <h2 style="margin-top:12px">操作日志</h2>
+    <div class="log" id="log"></div>
+  </section>
+
+  <section>
+    <h2>② 会话查询 / 续期 / 注销</h2>
+    <div class="row">
+      <input type="text" id="sid" placeholder="会话 ID，如 s01 / short-lived">
+      <button class="primary" onclick="query()">查询</button>
+      <input type="number" id="extend" value="1800" min="1" title="续期秒数">
+      <button onclick="renew()">续期</button>
+      <button class="danger" onclick="revoke()">注销</button>
+    </div>
+    <pre id="result">（查询结果）</pre>
+  </section>
+
+  <section>
+    <h2>③ 会话列表（新旧库合并视图，点击行填入查询框）</h2>
+    <table>
+      <thead><tr><th>会话 ID</th><th>用户</th><th>有效</th><th>来源</th><th>到期时刻 (UTC)</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const api = async (path, method='GET', body=null) => {
+  const opt = {method, headers:{'Content-Type':'application/json'}};
+  if (body) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw {status: r.status, data};
+  return data;
+};
+const esc = s => String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+async function refresh() {
+  try {
+    const st = await api('/api/migration/status');
+    const b = [];
+    const smap = {idle:['b-muted','空闲'], running:['b-ok','搬运中'],
+                  paused:['b-warn','已暂停'], done:['b-ok','已完成']};
+    const [cls, txt] = smap[st.status] || ['b-muted', st.status];
+    b.push(`<span class="badge ${cls}">迁移状态：${txt}</span>`);
+    b.push(st.fallback_enabled
+      ? '<span class="badge b-warn">旧库回读：开启</span>'
+      : '<span class="badge b-muted">旧库回读：已关闭</span>');
+    b.push(st.new_reachable
+      ? '<span class="badge b-ok">新库连通</span>' : '<span class="badge b-bad">新库断开</span>');
+    b.push(st.old_reachable
+      ? '<span class="badge b-ok">旧库连通</span>' : '<span class="badge b-bad">旧库断开</span>');
+    $('badges').innerHTML = b.join('');
+    $('counters').innerHTML =
+      `<span>已搬运 <b>${st.migrated}</b></span>` +
+      `<span>跳过已存在 <b>${st.skipped_existing}</b></span>` +
+      `<span>过期丢弃 <b>${st.expired}</b></span>` +
+      `<span>批次数 <b>${st.batches}</b></span>` +
+      `<span>游标 <b>${esc(st.cursor)}</b></span>`;
+    $('msg').textContent = st.message ? `提示：${st.message}` : '';
+    if (st.held) {
+      $('held').style.display = 'block';
+      $('held').innerHTML = `⏸ 持有批次 ${st.held.count} 条（${esc(st.held.read_at)} 读入，尚未写入）：` +
+        esc(st.held.sids.join('、'));
+    } else {
+      $('held').style.display = 'none';
+    }
+    $('log').textContent = (st.log || []).join('\n') || '（暂无日志）';
+  } catch (e) { $('msg').textContent = '状态获取失败：' + JSON.stringify(e.data || e); }
+}
+
+async function act(path) {
+  try { await api('/api/migration/' + path, 'POST'); }
+  catch (e) { alert('操作被拒绝：' + (e.data?.detail || JSON.stringify(e.data))); }
+  refresh(); loadList();
+}
+
+async function disableFallback() {
+  if (!confirm('确认搬运已完成？关闭后查询不再回旧库，旧库即可断开。')) return;
+  try { await api('/api/migration/fallback/disable', 'POST'); }
+  catch (e) { alert('操作被拒绝：' + (e.data?.detail || JSON.stringify(e.data))); }
+  refresh();
+}
+
+function show(v) { $('result').textContent = JSON.stringify(v, null, 2); }
+
+async function query() {
+  const sid = $('sid').value.trim(); if (!sid) return;
+  try { show(await api('/api/sessions/' + encodeURIComponent(sid))); }
+  catch (e) { show(e.data); }
+}
+
+async function renew() {
+  const sid = $('sid').value.trim(); if (!sid) return;
+  const ext = parseInt($('extend').value || '1800', 10);
+  try { show(await api(`/api/sessions/${encodeURIComponent(sid)}/renew`, 'POST', {extend_seconds: ext})); }
+  catch (e) { show(e.data); }
+  refresh(); loadList();
+}
+
+async function revoke() {
+  const sid = $('sid').value.trim(); if (!sid) return;
+  try { show(await api(`/api/sessions/${encodeURIComponent(sid)}/revoke`, 'POST')); }
+  catch (e) { show(e.data); }
+  refresh(); loadList();
+}
+
+async function loadList() {
+  try {
+    const d = await api('/api/sessions');
+    $('rows').innerHTML = d.sessions.map(s =>
+      `<tr onclick="document.getElementById('sid').value='${esc(s.sid)}';query()">` +
+      `<td>${esc(s.sid)}</td><td>${esc(s.user ?? '')}</td>` +
+      `<td class="${s.valid ? 'v-ok' : 'v-bad'}">${s.valid ? '有效' : '无效' + (s.reason ? '（' + esc(s.reason) + '）' : '')}</td>` +
+      `<td>${esc(s.source ?? '—')}</td><td>${esc(s.expires_at ?? '—')}</td></tr>`).join('');
+  } catch (e) { /* 忽略列表刷新失败 */ }
+}
+
+refresh(); loadList();
+setInterval(() => { refresh(); }, 2000);
+setInterval(loadList, 5000);
+</script>
+</body>
+</html>

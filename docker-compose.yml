@@ -1,0 +1,60 @@
+name: session-migration
+
+services:
+  redis-old:
+    image: redis:7.2-alpine
+    container_name: redis-old
+    # 挂载 ACL：应用账号只读，从服务端保证“搬运期间旧库只读”
+    command: ["redis-server", "--aclfile", "/etc/redis/users.acl"]
+    volumes:
+      - ./redis-old/users.acl:/etc/redis/users.acl:ro
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  redis-new:
+    image: redis:7.2-alpine
+    container_name: redis-new
+    ports:
+      - "6381:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  seed:
+    image: redis:7.2-alpine
+    container_name: seed-old-sessions
+    depends_on:
+      redis-old:
+        condition: service_healthy
+    environment:
+      OLD_HOST: redis-old
+      OLD_PORT: "6379"
+      SHORT_TTL: "45"   # 短会话寿命（秒），用于演示暂停期间过期不可恢复
+    volumes:
+      - ./seed:/seed:ro
+    command: ["sh", "/seed/seed.sh"]
+    restart: "no"
+
+  web:
+    build: .
+    container_name: migration-web
+    depends_on:
+      redis-old:
+        condition: service_healthy
+      redis-new:
+        condition: service_healthy
+    environment:
+      # 旧库使用只读 ACL 账号
+      REDIS_OLD_URL: redis://app:apppass@redis-old:6379/0
+      REDIS_NEW_URL: redis://redis-new:6379/0
+      MIGRATION_BATCH_COUNT: "5"
+      MIGRATION_BATCH_DELAY_MS: "300"
+    ports:
+      - "8000:8000"
